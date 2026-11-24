@@ -102,10 +102,11 @@ struct VideoGenerationConfig {
     std::optional<std::vector<float>> sigmas = std::nullopt;
 
     /// LTX-2.5: rewrite the prompt with the model's prompt enhancer before generating, as diffusers'
-    /// 'enable_prompt_enhancement' does.
+    /// 'enable_prompt_enhancement' does. For image-to-video it also describes the conditioning image.
     bool enable_prompt_enhancement = false;
 
-    /// System prompt of the prompt enhancer. Unset means LTX-2.5's default for text-to-video.
+    /// System prompt of the prompt enhancer. Unset means LTX-2.5's default for text-to-video, or for image-to-video
+    /// when an image conditions the generation.
     std::optional<std::string> system_prompt = std::nullopt;
 };
 

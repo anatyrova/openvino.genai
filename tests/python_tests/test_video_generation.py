@@ -31,8 +31,17 @@ VIDEO_GEN_MODELS = {
     LTX2_5_MODEL_ID: "optimum-intel-internal-testing/tiny-random-ltx2.5",
 }
 
+LTX2_MODEL_IDS = [LTX2_MODEL_ID, LTX2_3_MODEL_ID, LTX2_5_MODEL_ID]
 # diffusers' DISTILLED_SIGMA_VALUES, LTX-2.5's default schedule
 DISTILLED_SIGMAS = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
+NO_GUIDANCE = dict(
+    guidance_scale=1.0,
+    audio_guidance_scale=1.0,
+    stg_scale=0.0,
+    audio_stg_scale=0.0,
+    modality_scale=1.0,
+    audio_modality_scale=1.0,
+)
 
 
 # Per-model source override, e.g. VIDEO_GEN_MODEL_SOURCE_tiny_random_ltx2_3=/path/to/fixture. Lets a fixture
@@ -593,11 +602,6 @@ class TestVideoGenerationPipelines:
         pipe = ov_genai.Text2VideoPipeline(video_generation_model, "CPU")
         with pytest.raises(RuntimeError, match="TaylorSeer"):
             pipe.generate("test prompt", taylorseer_config=ov_genai.TaylorSeerCacheConfig(), **GEN_KWARGS)
-
-    @pytest.mark.parametrize("video_generation_model", [LTX2_MODEL_ID, LTX2_3_MODEL_ID, LTX2_5_MODEL_ID], indirect=True)
-    def test_image2video_rejected(self, video_generation_model):
-        with pytest.raises(RuntimeError, match="LTX2Pipeline"):
-            ov_genai.Image2VideoPipeline(video_generation_model)
 
     @pytest.mark.parametrize(
         "video_generation_model", [LTX_VIDEO_MODEL_ID, LTX2_MODEL_ID, LTX2_3_MODEL_ID, LTX2_5_MODEL_ID], indirect=True
@@ -1185,6 +1189,10 @@ def _count_steps(pipe, *args, **kwargs):
     return pipe.generate(*args, callback=callback, **kwargs), len(steps)
 
 
+def _random_frames(num_frames, height=32, width=32, seed=0):
+    return ov.Tensor(np.random.default_rng(seed).integers(0, 255, (num_frames, height, width, 3), dtype=np.uint8))
+
+
 class TestLTX2_5TextToVideo:
     GENERATE_KWARGS = dict(height=32, width=32)
 
@@ -1261,3 +1269,149 @@ class TestLTX2_5TextToVideo:
         pipe = ov_genai.Text2VideoPipeline(video_generation_model, "CPU")
         with pytest.raises(RuntimeError, match="decreasing"):
             pipe.generate("a cat", num_frames=9, sigmas=[0.5, 1.0], **self.GENERATE_KWARGS)
+
+
+class TestLTX2Conditioning:
+    """LTX-2 image-to-video from one or more images."""
+
+    GENERATE_KWARGS = dict(height=32, width=32, sigmas=[1.0, 0.75, 0.5], **NO_GUIDANCE)
+
+    @pytest.fixture(autouse=True)
+    def require_encoder(self, video_generation_model):
+        if not Path(video_generation_model, "vae_encoder").exists():
+            pytest.skip("vae_encoder not present in test model")
+
+    @pytest.mark.parametrize("video_generation_model", LTX2_MODEL_IDS, indirect=True)
+    def test_image_to_video(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        result = pipe.generate(_random_frames(1), "a cat", num_frames=9, **self.GENERATE_KWARGS)
+        assert result.video.data.shape == (1, 9, 32, 32, 3)
+        assert result.audio.data.size > 0
+
+    @pytest.mark.parametrize("video_generation_model", LTX2_MODEL_IDS, indirect=True)
+    def test_image_to_video_is_deterministic(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        image = _random_frames(1)
+        first = pipe.generate(
+            image, "a cat", num_frames=9, generator=ov_genai.CppStdGenerator(7), **self.GENERATE_KWARGS
+        )
+        second = pipe.generate(
+            image, "a cat", num_frames=9, generator=ov_genai.CppStdGenerator(7), **self.GENERATE_KWARGS
+        )
+        assert np.array_equal(first.video.data, second.video.data)
+
+    @pytest.mark.parametrize("video_generation_model", LTX2_MODEL_IDS, indirect=True)
+    def test_first_and_last_frame(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        images = [
+            ov_genai.VideoCondition(_random_frames(1, seed=1), index=0),
+            ov_genai.VideoCondition(_random_frames(1, seed=2), index=-1, strength=0.8),
+        ]
+        result = pipe.generate(images, "a cat", num_frames=17, **self.GENERATE_KWARGS)
+        # The last image is appended as keyframe tokens, which are dropped before decoding
+        assert result.video.data.shape == (1, 17, 32, 32, 3)
+
+    @pytest.mark.parametrize("video_generation_model", [LTX2_5_MODEL_ID], indirect=True)
+    def test_condition_past_the_end_is_skipped(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        images = [
+            ov_genai.VideoCondition(_random_frames(1), index=0),
+            ov_genai.VideoCondition(_random_frames(1), index=5),
+        ]
+        result = pipe.generate(images, "a cat", num_frames=9, **self.GENERATE_KWARGS)
+        assert result.video.data.shape == (1, 9, 32, 32, 3)
+
+    @pytest.mark.parametrize("video_generation_model", [LTX2_5_MODEL_ID], indirect=True)
+    def test_image_to_video_prompt_enhancement(self, video_generation_model):
+        if not Path(video_generation_model, "prompt_enhancer").exists():
+            pytest.skip("prompt_enhancer not present in test model")
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        image = _random_frames(1, 48, 64)  # resized to the output size, and to a long side of 896 for the enhancer
+        result = pipe.generate(image, "a cat", num_frames=9, enable_prompt_enhancement=True, **self.GENERATE_KWARGS)
+        assert result.video.data.shape == (1, 9, 32, 32, 3)
+
+    @pytest.mark.parametrize("video_generation_model", [LTX2_5_MODEL_ID], indirect=True)
+    def test_image_to_video_num_videos_per_prompt(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        result = pipe.generate(
+            _random_frames(1), "a cat", num_frames=9, num_videos_per_prompt=2, **self.GENERATE_KWARGS
+        )
+        assert result.video.data.shape == (2, 9, 32, 32, 3)
+
+    @pytest.mark.parametrize("video_generation_model", [LTX2_5_MODEL_ID], indirect=True)
+    def test_image_to_video_static_reshape(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model)
+        pipe.reshape(1, 9, 32, 32, 1.0)
+        pipe.compile("CPU")
+        result = pipe.generate(_random_frames(1), "a cat", **self.GENERATE_KWARGS)
+        assert result.video.data.shape == (1, 9, 32, 32, 3)
+
+    @pytest.mark.parametrize("video_generation_model", [LTX2_5_MODEL_ID], indirect=True)
+    def test_empty_image_rejected(self, video_generation_model):
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU")
+        with pytest.raises(RuntimeError, match="must not be empty"):
+            pipe.generate(
+                ov.Tensor(np.zeros((0, 32, 3), dtype=np.uint8)), "a cat", num_frames=9, **self.GENERATE_KWARGS
+            )
+
+    @pytest.mark.parametrize("video_generation_model", [LTX2_5_MODEL_ID], indirect=True)
+    def test_vae_constructors(self, video_generation_model):
+        encoder, decoder = Path(video_generation_model, "vae_encoder"), Path(video_generation_model, "vae_decoder")
+        # The encoder paths are keyword-only, so two positional strings stay the decoder path and the device
+        assert not ov_genai.AutoencoderKLLTX2Video(str(decoder), "CPU").has_encoder()
+        assert ov_genai.AutoencoderKLLTX2Video(vae_encoder_path=encoder, vae_decoder_path=decoder).has_encoder()
+        vae = ov_genai.AutoencoderKLLTX2Video(vae_encoder_path=encoder, vae_decoder_path=decoder, device="CPU")
+        latent = vae.encode(ov.Tensor(np.zeros((1, 3, 9, 32, 32), dtype=np.float32)))
+        assert list(latent.shape)[2:] == [2, 1, 1]
+
+
+def _optimum_ltx2_pipelines():
+    optimum = pytest.importorskip("optimum.intel.openvino")
+    if not hasattr(optimum, "OVLTX2ImageToVideoPipeline"):
+        pytest.skip("optimum-intel without LTX-2 image-to-video")
+    return optimum
+
+
+class TestLTX2ConditioningParity:
+    """GenAI against optimum-intel's OVLTX2ImageToVideoPipeline on the same export. The
+    prompt is empty because the tiny tokenizers turn any text into unknown tokens differently in HF and OpenVINO."""
+
+    KWARGS = dict(height=64, width=64, frame_rate=24.0, **NO_GUIDANCE)
+
+    @staticmethod
+    def _compare(genai_result, video, audio):
+        genai_video = genai_result.video.data.astype(np.float32)
+        assert np.abs(genai_video - np.round(np.asarray(video) * 255.0)).max() <= 2
+        assert np.abs(genai_result.audio.data - audio.float().numpy()).max() < 1e-4
+
+    @pytest.mark.parametrize("video_generation_model", LTX2_MODEL_IDS, indirect=True)
+    def test_image_to_video(self, video_generation_model):
+        optimum = _optimum_ltx2_pipelines()
+        import torch
+        from PIL import Image
+
+        image = np.random.default_rng(0).integers(0, 255, (64, 64, 3), dtype=np.uint8)
+        reference = optimum.OVLTX2ImageToVideoPipeline.from_pretrained(
+            video_generation_model, ov_config={"INFERENCE_PRECISION_HINT": "f32"}
+        )
+        video, audio = reference(
+            image=Image.fromarray(image),
+            prompt="",
+            num_frames=17,
+            sigmas=DISTILLED_SIGMAS,
+            image_crf=0,
+            generator=torch.Generator().manual_seed(42),
+            output_type="np",
+            return_dict=False,
+            **self.KWARGS,
+        )
+        pipe = ov_genai.Image2VideoPipeline(video_generation_model, "CPU", INFERENCE_PRECISION_HINT="f32")
+        result = pipe.generate(
+            ov.Tensor(image),
+            "",
+            num_frames=17,
+            sigmas=DISTILLED_SIGMAS,
+            generator=ov_genai.TorchGenerator(42),
+            **self.KWARGS,
+        )
+        self._compare(result, video, audio)

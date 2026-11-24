@@ -24,6 +24,8 @@
 #include "openvino/genai/video_generation/ltx2_text_connectors.hpp"
 #include "openvino/genai/video_generation/ltx2_video_transformer_3d_model.hpp"
 #include "openvino/genai/video_generation/ltx2_vocoder.hpp"
+#include "openvino/genai/video_generation/video_condition.hpp"
+#include "video_generation/ltx2_conditioning.hpp"
 #include "video_generation/ltx2_prompt_enhancer.hpp"
 #include "video_generation/video_generation_utils.hpp"
 #include "video_generation/video_pipeline.hpp"
@@ -181,6 +183,7 @@ ov::Tensor unpack_audio_latents(const ov::Tensor& latents, size_t num_channels, 
 namespace ov::genai {
 
 class LTX2Pipeline : public VideoPipeline {
+    VideoPipelineType m_pipeline_type = VideoPipelineType::TEXT_2_VIDEO;
     std::shared_ptr<IScheduler> m_video_scheduler;
     std::shared_ptr<IScheduler> m_audio_scheduler;
     FlowMatchEulerDiscreteScheduler::Config m_scheduler_config;
@@ -292,10 +295,25 @@ class LTX2Pipeline : public VideoPipeline {
                source.compare(source.size() - suffix.size(), suffix.size(), suffix) == 0;
     }
 
-    // diffusers' enhance_prompt
-    std::string enhance_prompt(const std::string& prompt, const VideoGenerationConfig& generation_config) {
+    struct ConditioningRequest {
+        const ov::Tensor* image = nullptr;  // a single image, diffusers' LTX2ImageToVideoPipeline
+        std::vector<VideoCondition> conditions;
+    };
+
+    // diffusers' enhance_prompt: the enhancer describes the single image, or the first frame of the first condition
+    std::string enhance_prompt(const std::string& prompt,
+                               const VideoGenerationConfig& generation_config,
+                               const ConditioningRequest& request) {
         OPENVINO_ASSERT(m_prompt_enhancer_tokenizer,
                         "Prompt enhancement needs an LTX-2.5 export with its 'prompt_enhancer' and 'processor'");
+        ov::Tensor first_frame;
+        if (request.image) {
+            first_frame = *request.image;
+        } else if (!request.conditions.empty()) {
+            const ov::Tensor frames = ltx2_conditioning::as_video(request.conditions.front().frames);
+            const ov::Shape shape = frames.get_shape();
+            first_frame = ov::Tensor(frames.get_element_type(), {1, shape[1], shape[2], shape[3]}, frames.data());
+        }
 
         // A GPU text encoding device holds its models only for the stage, so does the enhancer
         std::shared_ptr<LTX2PromptEnhancer> enhancer = m_prompt_enhancer;
@@ -309,7 +327,8 @@ class LTX2Pipeline : public VideoPipeline {
             }
         }
         const auto enhance_start = std::chrono::steady_clock::now();
-        const std::string enhanced = enhancer->enhance(prompt, generation_config.system_prompt);
+        const std::string enhanced =
+            enhancer->enhance(prompt, generation_config.system_prompt, first_frame ? &first_frame : nullptr);
         m_perf_metrics.encoder_inference_duration["prompt_enhancer"] =
             Ms{std::chrono::steady_clock::now() - enhance_start}.count();
         GENAI_INFO("Enhanced prompt: %s", enhanced.c_str());
@@ -483,7 +502,13 @@ class LTX2Pipeline : public VideoPipeline {
 public:
     LTX2Pipeline(const std::filesystem::path& root_dir,
                  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now())
-        : m_scheduler_config(root_dir / "scheduler/scheduler_config.json") {
+        : LTX2Pipeline(VideoPipelineType::TEXT_2_VIDEO, root_dir, start_time) {}
+
+    LTX2Pipeline(VideoPipelineType pipeline_type,
+                 const std::filesystem::path& root_dir,
+                 std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now())
+        : m_pipeline_type(pipeline_type),
+          m_scheduler_config(root_dir / "scheduler/scheduler_config.json") {
         m_models_dir = root_dir;
         const std::filesystem::path model_index_path = root_dir / "model_index.json";
 
@@ -519,8 +544,14 @@ public:
         }
 
         const std::string vae = data["vae"][1].get<std::string>();
-        if (vae == "AutoencoderKLLTX2Video") {
+        if (vae == "AutoencoderKLLTX2Video" && m_pipeline_type == VideoPipelineType::TEXT_2_VIDEO) {
             m_vae = std::make_shared<AutoencoderKLLTX2Video>(root_dir / "vae_decoder");
+        } else if (vae == "AutoencoderKLLTX2Video") {
+            OPENVINO_ASSERT(std::filesystem::exists(root_dir / "vae_encoder"),
+                            "Image conditioning needs a 'vae_encoder' directory in ",
+                            root_dir,
+                            ". Export the model with optimum-intel, which includes it for LTX-2.");
+            m_vae = std::make_shared<AutoencoderKLLTX2Video>(root_dir / "vae_encoder", root_dir / "vae_decoder");
         } else {
             OPENVINO_THROW("Unsupported '", vae, "' VAE decoder type");
         }
@@ -567,7 +598,14 @@ public:
                  const std::string& device,
                  const ov::AnyMap& properties,
                  std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now())
-        : LTX2Pipeline(models_dir, start_time) {
+        : LTX2Pipeline(VideoPipelineType::TEXT_2_VIDEO, models_dir, device, properties, start_time) {}
+
+    LTX2Pipeline(VideoPipelineType pipeline_type,
+                 const std::filesystem::path& models_dir,
+                 const std::string& device,
+                 const ov::AnyMap& properties,
+                 std::chrono::steady_clock::time_point start_time = std::chrono::steady_clock::now())
+        : LTX2Pipeline(pipeline_type, models_dir, start_time) {
         compile(device, properties);
         m_load_time = Ms{std::chrono::steady_clock::now() - start_time};
     }
@@ -613,11 +651,14 @@ public:
         const size_t audio_num_frames = audio_num_frames_for(generation_config);
         m_text_encoder->reshape(batch_size_multiplier, generation_config.max_sequence_length);
         m_connectors->reshape(generation_config.num_videos_per_prompt * batch_size_multiplier);
+        // Image and video conditioning pass one timestep per latent frame. Conditions placed after the first frame
+        // add tokens, which a static sequence cannot take.
         m_transformer->reshape(generation_config.num_videos_per_prompt,
                                generation_config.num_frames,
                                generation_config.height,
                                generation_config.width,
-                               audio_num_frames);
+                               audio_num_frames,
+                               m_pipeline_type != VideoPipelineType::TEXT_2_VIDEO);
         m_vae->reshape(generation_config.num_videos_per_prompt,
                        generation_config.num_frames,
                        generation_config.height,
@@ -631,6 +672,178 @@ public:
     }
 
     VideoGenerationResult generate(const std::string& positive_prompt, const ov::AnyMap& properties) override {
+        return generate_impl(positive_prompt, properties, ConditioningRequest{});
+    }
+
+    // diffusers' LTX2ImageToVideoPipeline: the image becomes the first frame
+    VideoGenerationResult generate(const ov::Tensor& image,
+                                   const std::string& positive_prompt,
+                                   const ov::AnyMap& properties) override {
+        OPENVINO_ASSERT(m_pipeline_type == VideoPipelineType::IMAGE_2_VIDEO,
+                        "Image-to-video generation needs a pipeline created for it");
+        ConditioningRequest request;
+        request.image = &image;
+        return generate_impl(positive_prompt, properties, request);
+    }
+
+    // diffusers' LTX2ConditionPipeline: one or more images placed at given latent frames
+    VideoGenerationResult generate(const std::vector<VideoCondition>& conditions,
+                                   const std::string& positive_prompt,
+                                   const ov::AnyMap& properties) override {
+        OPENVINO_ASSERT(m_pipeline_type == VideoPipelineType::IMAGE_2_VIDEO,
+                        "Image conditions need a pipeline created for image-to-video");
+        ConditioningRequest request;
+        request.conditions = conditions;
+        return generate_impl(positive_prompt, properties, request);
+    }
+
+private:
+    // The conditioned latent sequence: the video's tokens, then the keyframe tokens of conditions placed after the
+    // first frame
+    struct PreparedConditioning {
+        bool active = false;
+        // diffusers' LTX2ConditionPipeline draws the noise on the packed sequence, the other pipelines on 5D latents
+        bool packed_noise = false;
+        ov::Tensor init;                // [N, S, C] latents before noising: the conditions, zeros elsewhere
+        ov::Tensor clean;               // [N, S, C] the conditions' latents, zeros elsewhere
+        std::vector<float> frame_mask;  // conditioning mask per latent frame of the sequence
+        ov::Tensor keyframe_coords;     // [N, 3, K, 2] positions of the keyframe tokens, empty without them
+        size_t base_tokens = 0;         // tokens of the generated video
+    };
+
+    // Writes 'packed' [1, T, C] into every video of 'destination' [N, S, C] from token 'offset'
+    static void write_tokens(ov::Tensor& destination, const ov::Tensor& packed, size_t offset) {
+        const ov::Shape dst_shape = destination.get_shape(), src_shape = packed.get_shape();
+        const size_t row = src_shape[1] * src_shape[2];
+        for (size_t b = 0; b < dst_shape[0]; ++b) {
+            std::memcpy(destination.data<float>() + (b * dst_shape[1] + offset) * dst_shape[2],
+                        packed.data<const float>(),
+                        row * sizeof(float));
+        }
+    }
+
+    // Concatenates [N, S1, C] and [N, S2, C] along the tokens
+    static ov::Tensor concat_tokens(const ov::Tensor& first, const ov::Tensor& second) {
+        const ov::Shape a = first.get_shape(), b = second.get_shape();
+        ov::Tensor out(ov::element::f32, {a[0], a[1] + b[1], a[2]});
+        float* dst = out.data<float>();
+        for (size_t n = 0; n < a[0]; ++n) {
+            std::memcpy(dst, first.data<const float>() + n * a[1] * a[2], a[1] * a[2] * sizeof(float));
+            dst += a[1] * a[2];
+            std::memcpy(dst, second.data<const float>() + n * b[1] * b[2], b[1] * b[2] * sizeof(float));
+            dst += b[1] * b[2];
+        }
+        return out;
+    }
+
+    PreparedConditioning prepare_conditioning(const ConditioningRequest& request,
+                                              const VideoGenerationConfig& config,
+                                              float frame_rate) {
+        PreparedConditioning prepared;
+        const size_t num_videos = config.num_videos_per_prompt;
+        const auto& transformer_config = m_transformer->get_config();
+        const size_t channels = transformer_config.in_channels;
+        const size_t tokens_per_frame = m_latent_height * m_latent_width;
+        const auto temporal_ratio = static_cast<size_t>(m_vae->get_config().temporal_compression_ratio);
+        prepared.base_tokens = m_latent_num_frames * tokens_per_frame;
+        prepared.frame_mask.assign(m_latent_num_frames, 0.0f);
+        if (!request.image && request.conditions.empty()) {
+            return prepared;
+        }
+        prepared.active = true;
+        prepared.packed_noise = request.image == nullptr;
+
+        auto vae = m_vae;
+        if (!m_deferred_vae_device.empty()) {
+            vae = std::make_shared<AutoencoderKLLTX2Video>(m_vae->clone());
+            vae->compile(m_deferred_vae_device, m_deferred_properties);
+        }
+        const auto encode_start = std::chrono::steady_clock::now();
+        auto encode_packed = [&](const ov::Tensor& pixels) {
+            ov::Tensor latent = vae->encode(pixels);
+            return video_generation_utils::pack_latents(latent,
+                                                        transformer_config.patch_size,
+                                                        transformer_config.patch_size_t);
+        };
+
+        prepared.init = ov::Tensor(ov::element::f32, {num_videos, prepared.base_tokens, channels});
+        std::fill_n(prepared.init.data<float>(), prepared.init.get_size(), 0.0f);
+        prepared.clean = ov::Tensor(ov::element::f32, prepared.init.get_shape());
+        std::fill_n(prepared.clean.data<float>(), prepared.clean.get_size(), 0.0f);
+
+        if (request.image) {
+            ov::Tensor image = ltx2_conditioning::as_video(*request.image);
+            OPENVINO_ASSERT(image.get_shape()[0] == 1, "Image-to-video takes a single image");
+            if (image.get_shape()[1] != static_cast<size_t>(config.height) ||
+                image.get_shape()[2] != static_cast<size_t>(config.width)) {
+                // diffusers' VideoProcessor resizes with PIL, bilinear
+                image = ltx2_conditioning::pillow_resize(image, config.height, config.width, /* bicubic */ false);
+            }
+            const ov::Tensor packed = encode_packed(ltx2_conditioning::image_to_pixels(image));
+            write_tokens(prepared.init, packed, 0);
+            write_tokens(prepared.clean, packed, 0);
+            prepared.frame_mask[0] = 1.0f;
+        }
+
+        std::vector<float> keyframe_mask;
+        ov::Tensor keyframe_tokens;
+        for (size_t i = 0; i < request.conditions.size(); ++i) {
+            const VideoCondition& condition = request.conditions[i];
+            size_t latent_index = 0;
+            if (!ltx2_conditioning::resolve_latent_index(condition.index, m_latent_num_frames, latent_index)) {
+                GENAI_WARN("The latent index %lld of condition %zu is too big for %zu latent frames; the condition "
+                           "is skipped",
+                           static_cast<long long>(condition.index),
+                           i,
+                           m_latent_num_frames);
+                continue;
+            }
+            const ov::Tensor frames = ltx2_conditioning::as_video(condition.frames);
+            const ov::Shape shape = frames.get_shape();
+            const size_t start_frame = latent_index == 0 ? 0 : (latent_index - 1) * temporal_ratio + 1;
+            const size_t keep =
+                ltx2_conditioning::trim_num_frames(start_frame, shape[0], config.num_frames, temporal_ratio);
+            const ov::Tensor kept(ov::element::u8, {keep, shape[1], shape[2], shape[3]}, frames.data());
+            const ov::Tensor packed =
+                encode_packed(ltx2_conditioning::preprocess_frames(kept, config.height, config.width));
+            const size_t latent_frames = packed.get_shape()[1] / tokens_per_frame;
+
+            if (latent_index == 0) {
+                // Replaces the first frames of the video
+                write_tokens(prepared.init, packed, 0);
+                write_tokens(prepared.clean, packed, 0);
+                std::fill_n(prepared.frame_mask.begin(), latent_frames, condition.strength);
+                continue;
+            }
+            // Appended as keyframe tokens positioned at their frame
+            ov::Tensor tokens(ov::element::f32, {num_videos, packed.get_shape()[1], channels});
+            write_tokens(tokens, packed, 0);
+            keyframe_tokens = keyframe_tokens ? concat_tokens(keyframe_tokens, tokens) : tokens;
+            keyframe_mask.insert(keyframe_mask.end(), latent_frames, condition.strength);
+            const ov::Tensor coords = ltx2_conditioning::keyframe_coords(num_videos,
+                                                                         latent_frames,
+                                                                         m_latent_height,
+                                                                         m_latent_width,
+                                                                         start_frame,
+                                                                         keep,
+                                                                         frame_rate,
+                                                                         transformer_config.vae_scale_factors);
+            prepared.keyframe_coords =
+                prepared.keyframe_coords ? ltx2_conditioning::concat_coords(prepared.keyframe_coords, coords) : coords;
+        }
+        if (keyframe_tokens) {
+            prepared.init = concat_tokens(prepared.init, keyframe_tokens);
+            prepared.clean = concat_tokens(prepared.clean, keyframe_tokens);
+            prepared.frame_mask.insert(prepared.frame_mask.end(), keyframe_mask.begin(), keyframe_mask.end());
+        }
+        m_perf_metrics.encoder_inference_duration["vae_encoder"] =
+            Ms{std::chrono::steady_clock::now() - encode_start}.count();
+        return prepared;
+    }
+
+    VideoGenerationResult generate_impl(const std::string& positive_prompt,
+                                        const ov::AnyMap& properties,
+                                        const ConditioningRequest& request) {
         const auto gen_start = std::chrono::steady_clock::now();
         m_perf_metrics.clean_up();
 
@@ -646,6 +859,9 @@ public:
                            merged_generation_config.sigmas->size());
             }
         }
+        OPENVINO_ASSERT(
+            m_pipeline_type != VideoPipelineType::IMAGE_2_VIDEO || request.image || !request.conditions.empty(),
+            "Image-to-video needs at least one image");
         const float audio_guidance_scale =
             merged_generation_config.audio_guidance_scale.value_or(merged_generation_config.guidance_scale);
 
@@ -663,7 +879,7 @@ public:
             merged_generation_config.frame_rate.value_or(m_default_config->frame_rate.value());
 
         const std::string prompt = merged_generation_config.enable_prompt_enhancement
-                                       ? enhance_prompt(positive_prompt, merged_generation_config)
+                                       ? enhance_prompt(positive_prompt, merged_generation_config, request)
                                        : positive_prompt;
         LTX2TextConnectors::Output connected =
             compute_hidden_states(prompt,
@@ -685,6 +901,18 @@ public:
         const size_t audio_num_frames = audio_num_frames_for(merged_generation_config);
         const size_t latent_mel_bins =
             m_audio_vae->get_config().mel_bins / m_audio_vae->get_config().mel_compression_ratio;
+
+        const PreparedConditioning conditioning = prepare_conditioning(request, merged_generation_config, frame_rate);
+        const size_t tokens_per_frame = m_latent_height * m_latent_width;
+        const size_t sequence_length =
+            conditioning.active ? conditioning.init.get_shape()[1] : conditioning.base_tokens;
+        // The timestep of each latent frame is t * (1 - mask): conditioned frames are less noisy, or clean
+        std::vector<float> frame_timestep_scales;
+        if (conditioning.active) {
+            for (const float mask : conditioning.frame_mask) {
+                frame_timestep_scales.push_back(1.0f - mask);
+            }
+        }
 
         auto transformer = m_transformer;
         if (!m_deferred_denoise_device.empty()) {
@@ -733,8 +961,11 @@ public:
 
         // Every pass runs at batch N, CFG included, so the transformer keeps a static batch. The positions
         // are the same for every pass, so RoPE is bound once for the whole generation.
-        transformer->set_rope_coords(prepare_video_coords(num_videos_per_prompt, frame_rate),
-                                     prepare_audio_coords(num_videos_per_prompt, audio_num_frames));
+        ov::Tensor video_coords = prepare_video_coords(num_videos_per_prompt, frame_rate);
+        if (conditioning.keyframe_coords) {
+            video_coords = ltx2_conditioning::concat_coords(video_coords, conditioning.keyframe_coords);
+        }
+        transformer->set_rope_coords(video_coords, prepare_audio_coords(num_videos_per_prompt, audio_num_frames));
         for (const auto& condition : std::map<std::string, size_t>{
                  {"num_frames", m_latent_num_frames},
                  {"height", m_latent_height},
@@ -767,34 +998,67 @@ public:
         }
         bind_conditioning(*transformer, conditional_conditioning);
 
-        ov::Shape video_noise_shape{num_videos_per_prompt,
-                                    transformer_config.in_channels,
-                                    m_latent_num_frames,
-                                    m_latent_height,
-                                    m_latent_width};
-        ov::Tensor video_noise = merged_generation_config.generator->randn_tensor(video_noise_shape);
-        ov::Tensor latent = video_generation_utils::pack_latents(video_noise,
-                                                                 transformer_config.patch_size,
-                                                                 transformer_config.patch_size_t);
-
-        ov::Shape audio_noise_shape{num_videos_per_prompt,
-                                    m_audio_vae->get_config().latent_channels,
-                                    audio_num_frames,
-                                    latent_mel_bins};
-        ov::Tensor audio_noise = merged_generation_config.generator->randn_tensor(audio_noise_shape);
-        ov::Tensor audio_latent = pack_audio_latents(audio_noise);
-
         // mu from the packed video sequence length, as in the reference; audio reuses it
-        const double mu = m_video_scheduler->calculate_shift(latent.get_shape().at(1));
+        const double mu = m_video_scheduler->calculate_shift(sequence_length);
+        const std::optional<std::vector<float>>& schedule = merged_generation_config.sigmas;
         // Separate scheduler instance for audio: step() tracks per-modality state
-        if (merged_generation_config.sigmas) {
-            m_video_scheduler->set_timesteps_from_sigmas(*merged_generation_config.sigmas, mu);
-            m_audio_scheduler->set_timesteps_from_sigmas(*merged_generation_config.sigmas, mu);
+        if (schedule) {
+            m_video_scheduler->set_timesteps_from_sigmas(*schedule, mu);
+            m_audio_scheduler->set_timesteps_from_sigmas(*schedule, mu);
         } else {
             m_video_scheduler->set_timesteps_with_mu(mu, merged_generation_config.num_inference_steps, 1.0f);
             m_audio_scheduler->set_timesteps_with_mu(mu, merged_generation_config.num_inference_steps, 1.0f);
         }
         std::vector<float> timesteps = m_video_scheduler->get_float_timesteps();
+
+        // The noise layouts of the diffusers pipelines this follows, so a seed gives the same video
+        ov::Tensor latent;
+        if (conditioning.packed_noise) {
+            latent = merged_generation_config.generator->randn_tensor(
+                ov::Shape{num_videos_per_prompt, sequence_length, transformer_config.in_channels});
+        } else {
+            ov::Shape video_noise_shape{num_videos_per_prompt,
+                                        transformer_config.in_channels,
+                                        m_latent_num_frames,
+                                        m_latent_height,
+                                        m_latent_width};
+            ov::Tensor video_noise = merged_generation_config.generator->randn_tensor(video_noise_shape);
+            latent = video_generation_utils::pack_latents(video_noise,
+                                                          transformer_config.patch_size,
+                                                          transformer_config.patch_size_t);
+        }
+        if (conditioning.active) {
+            // Noised to 'noise_scale' where nothing is kept:
+            //   latents = noise * s + init * (1 - s), s = (1 - mask) * noise_scale
+            // diffusers' LTX2ConditionPipeline uses the first sigma; image-to-video starts from pure noise.
+            const float noise_scale = conditioning.packed_noise && schedule ? schedule->front() : 1.0f;
+            const size_t channels = transformer_config.in_channels;
+            float* data = latent.data<float>();
+            const float* init = conditioning.init.data<const float>();
+            for (size_t n = 0; n < num_videos_per_prompt; ++n) {
+                for (size_t token = 0; token < sequence_length; ++token) {
+                    const float scaled = (1.0f - conditioning.frame_mask[token / tokens_per_frame]) * noise_scale;
+                    const size_t offset = (n * sequence_length + token) * channels;
+                    for (size_t c = 0; c < channels; ++c) {
+                        data[offset + c] = data[offset + c] * scaled + init[offset + c] * (1.0f - scaled);
+                    }
+                }
+            }
+        }
+
+        ov::Tensor audio_latent;
+        if (conditioning.packed_noise) {
+            audio_latent = merged_generation_config.generator->randn_tensor(
+                ov::Shape{num_videos_per_prompt,
+                          audio_num_frames,
+                          m_audio_vae->get_config().latent_channels * latent_mel_bins});
+        } else {
+            ov::Shape audio_noise_shape{num_videos_per_prompt,
+                                        m_audio_vae->get_config().latent_channels,
+                                        audio_num_frames,
+                                        latent_mel_bins};
+            audio_latent = pack_audio_latents(merged_generation_config.generator->randn_tensor(audio_noise_shape));
+        }
 
         // x0-space guidance, as in diffusers' LTX2Pipeline. Each term is 'scale * sigma * (v_other - v_cond)':
         //   guided = x0_cond + (gs - 1) * (x0_cond - x0_uncond_text)   classifier-free guidance
@@ -847,6 +1111,7 @@ public:
             return velocity;
         };
         ov::Tensor video_velocity_buffer(ov::element::f32, {}), audio_velocity_buffer(ov::element::f32, {});
+        ov::Tensor blended_velocity(ov::element::f32, {});
 
         // infer() returns the request's output tensors, which the next pass overwrites
         ov::Tensor video_pred(ov::element::f32, {}), audio_pred(ov::element::f32, {});
@@ -860,7 +1125,8 @@ public:
 
         auto run_pass = [&](float t, bool isolate_modalities, const std::vector<int64_t>& blocks) {
             const auto pass_start = std::chrono::steady_clock::now();
-            auto predictions = transformer->infer(latent, audio_latent, t, isolate_modalities, blocks);
+            auto predictions =
+                transformer->infer(latent, audio_latent, t, isolate_modalities, blocks, frame_timestep_scales);
             const auto pass_duration =
                 ov::genai::PerfMetrics::get_microsec(std::chrono::steady_clock::now() - pass_start);
             m_perf_metrics.raw_metrics.transformer_inference_durations.emplace_back(MicroSeconds(pass_duration));
@@ -931,6 +1197,30 @@ public:
                                                  audio_guidance_rescale, sigma, audio_velocity_buffer);
             }
 
+            if (conditioning.active) {
+                // diffusers' post-process blend: x0 = x0 * (1 - mask) + clean * mask, then back to a velocity.
+                // Fully kept tokens (mask 1) stay exactly at their clean latents.
+                blended_velocity.set_shape(latent.get_shape());
+                const size_t channels = transformer_config.in_channels;
+                const float* sample = latent.data<const float>();
+                const float* velocity = video_velocity.data<const float>();
+                const float* clean = conditioning.clean.data<const float>();
+                float* out = blended_velocity.data<float>();
+                for (size_t n = 0; n < num_videos_per_prompt; ++n) {
+                    for (size_t token = 0; token < sequence_length; ++token) {
+                        const float mask = conditioning.frame_mask[token / tokens_per_frame];
+                        const size_t offset = (n * sequence_length + token) * channels;
+                        for (size_t c = 0; c < channels; ++c) {
+                            const size_t i = offset + c;
+                            const float x0 = sample[i] - velocity[i] * sigma;
+                            const float blended = x0 * (1.0f - mask) + clean[i] * mask;
+                            out[i] = (sample[i] - blended) / sigma;
+                        }
+                    }
+                }
+                video_velocity = blended_velocity;
+            }
+
             auto video_step_result = m_video_scheduler->step(video_velocity,
                                                              latent,
                                                              inference_step,
@@ -962,6 +1252,17 @@ public:
         }
 
         transformer.reset();
+        if (conditioning.active && sequence_length != conditioning.base_tokens) {
+            // The keyframe tokens only steer the video; decode the video's own tokens
+            const size_t channels = transformer_config.in_channels;
+            ov::Tensor video_tokens(ov::element::f32, {num_videos_per_prompt, conditioning.base_tokens, channels});
+            for (size_t n = 0; n < num_videos_per_prompt; ++n) {
+                std::memcpy(video_tokens.data<float>() + n * conditioning.base_tokens * channels,
+                            latent.data<const float>() + n * sequence_length * channels,
+                            conditioning.base_tokens * channels * sizeof(float));
+            }
+            latent = video_tokens;
+        }
         latent = postprocess_latents(latent);
 
         OPENVINO_ASSERT(!m_vae->get_config().timestep_conditioning,
@@ -1002,6 +1303,7 @@ public:
                                      static_cast<uint32_t>(m_vocoder->get_config().output_sampling_rate)};
     }
 
+public:
     VideoGenerationResult decode(const ov::Tensor& latent) override {
         ov::Tensor postprocessed = postprocess_latents(latent);
 

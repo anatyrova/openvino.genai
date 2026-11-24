@@ -16,15 +16,16 @@
 #include "openvino/genai/chat_history.hpp"
 #include "openvino/genai/json_container.hpp"
 #include "openvino/genai/visual_language/pipeline.hpp"
+#include "video_generation/ltx2_conditioning.hpp"
 #include "video_generation/ltx2_system_prompts.hpp"
 
 namespace ov::genai {
 
 /**
  * LTX-2.5's prompt enhancer: a Gemma 4 VLM ('prompt_enhancer/') rewrites a short prompt into the detailed description
- * the model was trained on. Its tokenizer and chat template are the 'processor/' component. Follows diffusers'
- * LTX2Pipeline.enhance_prompt with GEMMA4_PROMPT_ENHANCEMENT_CONFIG: greedy decoding of up to 600 tokens without
- * repeated 5-grams.
+ * the model was trained on, looking at the conditioning image for image-to-video. Its tokenizer and chat template are
+ * the 'processor/' component. Follows diffusers' LTX2Pipeline.enhance_prompt with GEMMA4_PROMPT_ENHANCEMENT_CONFIG:
+ * greedy decoding of up to 600 tokens without repeated 5-grams.
  */
 class LTX2PromptEnhancer {
 public:
@@ -46,11 +47,27 @@ public:
                      properties,
                      read_generation_config(root_dir / "prompt_enhancer")) {}
 
-    std::string enhance(const std::string& prompt, const std::optional<std::string>& system_prompt) {
-        // diffusers' messages for text-to-video
+    /// @param image A u8 image [H, W, 3] or [1, H, W, 3] to describe, or null for text-to-video
+    std::string enhance(const std::string& prompt,
+                        const std::optional<std::string>& system_prompt,
+                        const ov::Tensor* image) {
+        // diffusers' messages: for image-to-video the user turn is the image, then the text. The template renders the
+        // image as Gemma 4's native '<|image|>' tag, which the pipeline expands into the image tokens in place.
         nlohmann::json messages = nlohmann::json::array();
-        messages.push_back({{"role", "system"}, {"content", system_prompt.value_or(ltx2_prompts::T2V_SYSTEM_PROMPT)}});
-        messages.push_back({{"role", "user"}, {"content", "user prompt: " + prompt}});
+        messages.push_back(
+            {{"role", "system"},
+             {"content",
+              system_prompt.value_or(image ? ltx2_prompts::I2V_SYSTEM_PROMPT : ltx2_prompts::T2V_SYSTEM_PROMPT)}});
+        std::vector<ov::Tensor> images;
+        if (image) {
+            images.push_back(resize_long_side(ltx2_conditioning::as_video(*image)));
+            messages.push_back(
+                {{"role", "user"},
+                 {"content",
+                  {{{"type", "image"}}, {{"type", "text"}, {"text", "User Raw Input Prompt: " + prompt + "."}}}}});
+        } else {
+            messages.push_back({{"role", "user"}, {"content", "user prompt: " + prompt}});
+        }
         const std::string templated = m_pipeline.get_tokenizer().apply_chat_template(
             ChatHistory(JsonContainer::from_json_string(messages.dump())),
             true);
@@ -62,8 +79,7 @@ public:
         config.do_sample = false;
         config.no_repeat_ngram_size = 5;
         config.apply_chat_template = false;
-        const VLMDecodedResults result =
-            m_pipeline.generate(templated, std::vector<ov::Tensor>{}, config, std::monostate{});
+        const VLMDecodedResults result = m_pipeline.generate(templated, images, config, std::monostate{});
         return clean_response(result.texts.at(0));
     }
 
@@ -124,6 +140,18 @@ private:
                 ov::read_tensor_data(weights)};
         }
         return models;
+    }
+
+    // diffusers' _prepare_enhance_image: the long side to 896 pixels, bicubic
+    static ov::Tensor resize_long_side(const ov::Tensor& image) {
+        const ov::Shape shape = image.get_shape();  // [1, H, W, 3]
+        const double scale = 896.0 / static_cast<double>(std::max(shape[1], shape[2]));
+        const auto height = static_cast<int64_t>(static_cast<double>(shape[1]) * scale);
+        const auto width = static_cast<int64_t>(static_cast<double>(shape[2]) * scale);
+        if (height == static_cast<int64_t>(shape[1]) && width == static_cast<int64_t>(shape[2])) {
+            return image;
+        }
+        return ltx2_conditioning::pillow_resize(image, height, width, /* bicubic */ true);
     }
 
     VLMPipeline m_pipeline;

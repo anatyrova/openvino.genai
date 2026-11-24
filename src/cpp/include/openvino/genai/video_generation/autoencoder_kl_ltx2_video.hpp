@@ -35,12 +35,27 @@ public:
                            const std::string& device,
                            const ov::AnyMap& properties = {});
 
+    /// A device given as a string literal, which would also convert to the encoder constructor's decoder path
+    AutoencoderKLLTX2Video(const std::filesystem::path& vae_decoder_path,
+                           const char* device,
+                           const ov::AnyMap& properties = {});
+
     template <typename... Properties,
               typename std::enable_if<ov::util::StringAny<Properties...>::value, bool>::type = true>
     AutoencoderKLLTX2Video(const std::filesystem::path& vae_decoder_path,
                            const std::string& device,
                            Properties&&... properties)
         : AutoencoderKLLTX2Video(vae_decoder_path, device, ov::AnyMap{std::forward<Properties>(properties)...}) {}
+
+    /// With a VAE encoder, for image and video conditioning. The encoder keeps dynamic shapes. Pass the paths as
+    /// std::filesystem::path: two string literals select the decoder and device constructor.
+    AutoencoderKLLTX2Video(const std::filesystem::path& vae_encoder_path,
+                           const std::filesystem::path& vae_decoder_path);
+
+    AutoencoderKLLTX2Video(const std::filesystem::path& vae_encoder_path,
+                           const std::filesystem::path& vae_decoder_path,
+                           const std::string& device,
+                           const ov::AnyMap& properties = {});
 
     AutoencoderKLLTX2Video(const AutoencoderKLLTX2Video&);
 
@@ -60,12 +75,24 @@ public:
 
     ov::Tensor decode(const ov::Tensor& latent);
 
+    bool has_encoder() const;
+
+    /**
+     * Encodes a video to normalized latents, (latent - mean) * scaling_factor / std, taking the mean of the latent
+     * distribution as diffusers does for conditions, so no random generator is involved.
+     * @param sample A video [B, 3, F, H, W] in [-1, 1], f32, F = 8 * k + 1
+     * @returns Normalized latents [B, C, (F - 1) / 8 + 1, H / 32, W / 32]
+     */
+    ov::Tensor encode(const ov::Tensor& sample);
+
 private:
     void merge_vae_video_post_processing() const;
 
     Config m_config;
     ov::InferRequest m_decoder_request;
     std::shared_ptr<ov::Model> m_decoder_model;
+    ov::InferRequest m_encoder_request;
+    std::shared_ptr<ov::Model> m_encoder_model;
 };
 
 }  // namespace ov::genai

@@ -11,6 +11,7 @@
 #include "logger.hpp"
 #include "openvino/genai/video_generation/generation_config.hpp"
 #include "openvino/genai/video_generation/text2video_pipeline.hpp"
+#include "openvino/genai/video_generation/video_condition.hpp"
 
 namespace ov::genai {
 
@@ -27,6 +28,13 @@ public:
                                            const std::string& positive_prompt,
                                            const ov::AnyMap& properties) {
         OPENVINO_THROW("Image-to-video generation is not supported by this pipeline");
+    }
+
+    /// Generation through images placed at given latent frames
+    virtual VideoGenerationResult generate(const std::vector<VideoCondition>& conditions,
+                                           const std::string& positive_prompt,
+                                           const ov::AnyMap& properties) {
+        OPENVINO_THROW("Image conditions are not supported by this pipeline");
     }
 
     virtual VideoGenerationResult decode(const ov::Tensor& latent) = 0;

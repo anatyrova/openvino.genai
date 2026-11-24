@@ -10,6 +10,7 @@
 
 #include "openvino/genai/video_generation/image2video_pipeline.hpp"
 #include "openvino/genai/video_generation/text2video_pipeline.hpp"
+#include "openvino/genai/video_generation/video_condition.hpp"
 #include "py_utils.hpp"
 #include "tokenizer/tokenizers_path.hpp"
 
@@ -114,6 +115,25 @@ void init_video_generation_pipelines(py::module_& m) {
             },
             py::arg("prompt"));
 
+    py::class_<ov::genai::VideoCondition>(m,
+                                          "VideoCondition",
+                                          "Frames that a generated LTX-2 video must contain at a latent frame index.")
+        .def(py::init([](const ov::Tensor& frames, int64_t index, float strength) {
+                 return ov::genai::VideoCondition{frames, index, strength};
+             }),
+             py::arg("frames"),
+             py::arg("index") = 0,
+             py::arg("strength") = 1.0f,
+             R"(
+                frames (ov.Tensor): u8 RGB frames [F, H, W, 3] or an image [H, W, 3].
+                index (int): Latent frame index of the first frame (8 video frames per latent frame, negative values
+                    count from the end).
+                strength (float): 1.0 keeps the frames as they are, lower values let the model change them.
+            )")
+        .def_readwrite("frames", &ov::genai::VideoCondition::frames)
+        .def_readwrite("index", &ov::genai::VideoCondition::index)
+        .def_readwrite("strength", &ov::genai::VideoCondition::strength);
+
     py::class_<ov::genai::Image2VideoPipeline>(m, "Image2VideoPipeline")
         .def(py::init([](const std::filesystem::path& models_path) {
                  ScopedVar env_manager(pyutils::ov_tokenizers_module_path());
@@ -178,6 +198,23 @@ void init_video_generation_pipelines(py::module_& m) {
             },
             py::arg("image"),
             py::arg("prompt"))
+        .def(
+            "generate",
+            [](ov::genai::Image2VideoPipeline& pipe,
+               const std::vector<ov::genai::VideoCondition>& images,
+               const std::string& prompt,
+               const py::kwargs& kwargs) {
+                auto properties = pyutils::kwargs_to_any_map(kwargs);
+                ov::genai::VideoGenerationResult result;
+                {
+                    py::gil_scoped_release rel;
+                    result = pipe.generate(images, prompt, properties);
+                }
+                return result;
+            },
+            py::arg("images"),
+            py::arg("prompt"),
+            "Generates a video through one or more images (VideoCondition) placed at latent frame indices. LTX-2 only.")
         .def("decode",
              [](ov::genai::Image2VideoPipeline& pipe, const ov::Tensor& latent) {
                  py::gil_scoped_release rel;

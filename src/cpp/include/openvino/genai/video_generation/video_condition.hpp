@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "openvino/runtime/properties.hpp"
 #include "openvino/runtime/tensor.hpp"
 
 #include "openvino/genai/visibility.hpp"
@@ -31,5 +32,8 @@ struct OPENVINO_GENAI_EXPORTS VideoCondition {
     /// How strongly the frames are kept: 1.0 keeps them as they are, lower values let the model change them.
     float strength = 1.0f;
 };
+
+/// Conditions for LTX-2 image-to-video and video-to-video generation.
+static constexpr ov::Property<std::vector<VideoCondition>> conditions{"conditions"};
 
 }  // namespace ov::genai

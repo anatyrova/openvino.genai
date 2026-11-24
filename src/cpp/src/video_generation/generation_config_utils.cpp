@@ -23,6 +23,14 @@ void validate_generation_config(const VideoGenerationConfig& config) {
             OPENVINO_ASSERT(i == 0 || sigmas[i] < sigmas[i - 1], "'sigmas' must be strictly decreasing");
         }
     }
+    if (config.noise_scale) {
+        OPENVINO_ASSERT(*config.noise_scale > 0.0f && *config.noise_scale <= 1.0f,
+                        "'noise_scale' must be in (0, 1], got ",
+                        *config.noise_scale);
+    }
+    if (config.edit_num_steps) {
+        OPENVINO_ASSERT(*config.edit_num_steps > 0, "'edit_num_steps' must be positive");
+    }
 }
 
 void resolve_negative_prompt(VideoGenerationConfig& config) {
@@ -48,6 +56,8 @@ void update_generation_config(VideoGenerationConfig& config, const ov::AnyMap& p
     read_anymap_param(properties, "audio_guidance_rescale", config.audio_guidance_rescale);
     read_anymap_param(properties, "spatio_temporal_guidance_blocks", config.spatio_temporal_guidance_blocks);
     read_anymap_param(properties, "sigmas", config.sigmas);
+    read_anymap_param(properties, "noise_scale", config.noise_scale);
+    read_anymap_param(properties, "edit_num_steps", config.edit_num_steps);
     read_anymap_param(properties, "enable_prompt_enhancement", config.enable_prompt_enhancement);
     read_anymap_param(properties, "system_prompt", config.system_prompt);
     read_anymap_param(properties, "num_videos_per_prompt", config.num_videos_per_prompt);

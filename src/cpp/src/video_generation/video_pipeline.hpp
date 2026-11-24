@@ -18,6 +18,7 @@ namespace ov::genai {
 enum class VideoPipelineType {
     TEXT_2_VIDEO = 0,
     IMAGE_2_VIDEO = 1,
+    VIDEO_2_VIDEO = 2,
 };
 
 class VideoPipeline {
@@ -30,11 +31,12 @@ public:
         OPENVINO_THROW("Image-to-video generation is not supported by this pipeline");
     }
 
-    /// Generation through images placed at given latent frames
-    virtual VideoGenerationResult generate(const std::vector<VideoCondition>& conditions,
+    /// Generation conditioned on 'conditions', and with a 'source_video' to edit if it is not null
+    virtual VideoGenerationResult generate(const ov::Tensor* source_video,
+                                           const std::vector<VideoCondition>& conditions,
                                            const std::string& positive_prompt,
                                            const ov::AnyMap& properties) {
-        OPENVINO_THROW("Image conditions are not supported by this pipeline");
+        OPENVINO_THROW("Image and video conditions are not supported by this pipeline");
     }
 
     virtual VideoGenerationResult decode(const ov::Tensor& latent) = 0;

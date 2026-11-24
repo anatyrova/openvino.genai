@@ -97,7 +97,7 @@ VideoGenerationResult Image2VideoPipeline::generate(const ov::Tensor& image,
 VideoGenerationResult Image2VideoPipeline::generate(const std::vector<VideoCondition>& images,
                                                     const std::string& positive_prompt,
                                                     const ov::AnyMap& properties) {
-    return m_impl->generate(images, positive_prompt, properties);
+    return m_impl->generate(nullptr, images, positive_prompt, properties);
 }
 
 VideoGenerationResult Image2VideoPipeline::decode(const ov::Tensor& latent) {

@@ -101,12 +101,20 @@ struct VideoGenerationConfig {
     /// is applied to it as diffusers does. LTX-2.5 exports default to the 8 sigmas of its distilled transformer.
     std::optional<std::vector<float>> sigmas = std::nullopt;
 
+    /// Video-to-video edit: the noise level, a sigma in (0, 1], the source video is noised to before denoising.
+    /// Unset with `edit_num_steps` set means the first sigma of the steps that run.
+    std::optional<float> noise_scale = std::nullopt;
+
+    /// Video-to-video edit: run only the last `edit_num_steps` steps of the schedule. Unset with `noise_scale` set
+    /// means the steps whose sigma is not above `noise_scale`.
+    std::optional<size_t> edit_num_steps = std::nullopt;
+
     /// LTX-2.5: rewrite the prompt with the model's prompt enhancer before generating, as diffusers'
     /// 'enable_prompt_enhancement' does. For image-to-video it also describes the conditioning image.
     bool enable_prompt_enhancement = false;
 
     /// System prompt of the prompt enhancer. Unset means LTX-2.5's default for text-to-video, or for image-to-video
-    /// when an image conditions the generation.
+    /// when an image or video conditions the generation.
     std::optional<std::string> system_prompt = std::nullopt;
 };
 
@@ -151,6 +159,10 @@ static constexpr ov::Property<std::vector<int64_t>> spatio_temporal_guidance_blo
     "spatio_temporal_guidance_blocks"};
 /// Custom denoising schedule; see 'VideoGenerationConfig::sigmas'.
 static constexpr ov::Property<std::vector<float>> sigmas{"sigmas"};
+/// Video-to-video edit noise level; see 'VideoGenerationConfig::noise_scale'.
+static constexpr ov::Property<float> noise_scale{"noise_scale"};
+/// Video-to-video edit step count; see 'VideoGenerationConfig::edit_num_steps'.
+static constexpr ov::Property<size_t> edit_num_steps{"edit_num_steps"};
 /// Rewrite the prompt with LTX-2.5's prompt enhancer; see 'VideoGenerationConfig::enable_prompt_enhancement'.
 static constexpr ov::Property<bool> enable_prompt_enhancement{"enable_prompt_enhancement"};
 /// System prompt of the prompt enhancer; see 'VideoGenerationConfig::system_prompt'.

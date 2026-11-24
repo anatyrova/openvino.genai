@@ -297,6 +297,7 @@ class LTX2Pipeline : public VideoPipeline {
 
     struct ConditioningRequest {
         const ov::Tensor* image = nullptr;  // a single image, diffusers' LTX2ImageToVideoPipeline
+        const ov::Tensor* video = nullptr;  // a source video to edit
         std::vector<VideoCondition> conditions;
     };
 
@@ -548,7 +549,7 @@ public:
             m_vae = std::make_shared<AutoencoderKLLTX2Video>(root_dir / "vae_decoder");
         } else if (vae == "AutoencoderKLLTX2Video") {
             OPENVINO_ASSERT(std::filesystem::exists(root_dir / "vae_encoder"),
-                            "Image conditioning needs a 'vae_encoder' directory in ",
+                            "Image and video conditioning need a 'vae_encoder' directory in ",
                             root_dir,
                             ". Export the model with optimum-intel, which includes it for LTX-2.");
             m_vae = std::make_shared<AutoencoderKLLTX2Video>(root_dir / "vae_encoder", root_dir / "vae_decoder");
@@ -686,13 +687,15 @@ public:
         return generate_impl(positive_prompt, properties, request);
     }
 
-    // diffusers' LTX2ConditionPipeline: one or more images placed at given latent frames
-    VideoGenerationResult generate(const std::vector<VideoCondition>& conditions,
+    // diffusers' LTX2ConditionPipeline: conditions, and a source video to edit
+    VideoGenerationResult generate(const ov::Tensor* source_video,
+                                   const std::vector<VideoCondition>& conditions,
                                    const std::string& positive_prompt,
                                    const ov::AnyMap& properties) override {
-        OPENVINO_ASSERT(m_pipeline_type == VideoPipelineType::IMAGE_2_VIDEO,
-                        "Image conditions need a pipeline created for image-to-video");
+        OPENVINO_ASSERT(m_pipeline_type != VideoPipelineType::TEXT_2_VIDEO,
+                        "Image and video conditions need a pipeline created for image-to-video or video-to-video");
         ConditioningRequest request;
+        request.video = source_video;
         request.conditions = conditions;
         return generate_impl(positive_prompt, properties, request);
     }
@@ -704,7 +707,7 @@ private:
         bool active = false;
         // diffusers' LTX2ConditionPipeline draws the noise on the packed sequence, the other pipelines on 5D latents
         bool packed_noise = false;
-        ov::Tensor init;                // [N, S, C] latents before noising: the conditions, zeros elsewhere
+        ov::Tensor init;                // [N, S, C] latents before noising: the edited video, conditions, zeros
         ov::Tensor clean;               // [N, S, C] the conditions' latents, zeros elsewhere
         std::vector<float> frame_mask;  // conditioning mask per latent frame of the sequence
         ov::Tensor keyframe_coords;     // [N, 3, K, 2] positions of the keyframe tokens, empty without them
@@ -738,6 +741,7 @@ private:
 
     PreparedConditioning prepare_conditioning(const ConditioningRequest& request,
                                               const VideoGenerationConfig& config,
+                                              bool edit,
                                               float frame_rate) {
         PreparedConditioning prepared;
         const size_t num_videos = config.num_videos_per_prompt;
@@ -747,7 +751,7 @@ private:
         const auto temporal_ratio = static_cast<size_t>(m_vae->get_config().temporal_compression_ratio);
         prepared.base_tokens = m_latent_num_frames * tokens_per_frame;
         prepared.frame_mask.assign(m_latent_num_frames, 0.0f);
-        if (!request.image && request.conditions.empty()) {
+        if (!request.image && !edit && request.conditions.empty()) {
             return prepared;
         }
         prepared.active = true;
@@ -783,6 +787,16 @@ private:
             write_tokens(prepared.init, packed, 0);
             write_tokens(prepared.clean, packed, 0);
             prepared.frame_mask[0] = 1.0f;
+        }
+
+        if (edit) {
+            const ov::Tensor source = ltx2_conditioning::as_video(*request.video);
+            const ov::Shape shape = source.get_shape();
+            const size_t keep = ltx2_conditioning::trim_num_frames(0, shape[0], config.num_frames, temporal_ratio);
+            const ov::Tensor frames(ov::element::u8, {keep, shape[1], shape[2], shape[3]}, source.data());
+            write_tokens(prepared.init,
+                         encode_packed(ltx2_conditioning::preprocess_frames(frames, config.height, config.width)),
+                         0);
         }
 
         std::vector<float> keyframe_mask;
@@ -859,9 +873,33 @@ private:
                            merged_generation_config.sigmas->size());
             }
         }
+        // Editing noises the whole source video, so the output takes its length and size unless they are configured:
+        // passed to this call, or set in the generation config (set_generation_config, reshape) to something other
+        // than the model's default
+        const bool edit = request.video != nullptr &&
+                          (merged_generation_config.noise_scale || merged_generation_config.edit_num_steps);
+        OPENVINO_ASSERT(edit || !(merged_generation_config.noise_scale || merged_generation_config.edit_num_steps),
+                        "'noise_scale' and 'edit_num_steps' edit a source video: they apply to video-to-video only");
+        OPENVINO_ASSERT(request.video == nullptr || edit || !request.conditions.empty(),
+                        "Video-to-video needs an edit ('noise_scale' and / or 'edit_num_steps') or 'conditions'");
         OPENVINO_ASSERT(
             m_pipeline_type != VideoPipelineType::IMAGE_2_VIDEO || request.image || !request.conditions.empty(),
             "Image-to-video needs at least one image");
+        if (edit) {
+            const ov::Shape source_shape = ltx2_conditioning::as_video(*request.video).get_shape();
+            const auto temporal_ratio = static_cast<size_t>(m_vae->get_config().temporal_compression_ratio);
+            const auto spatial_ratio = static_cast<int64_t>(m_vae->get_config().spatial_compression_ratio);
+            if (!properties.count(ov::genai::num_frames.name()) &&
+                m_generation_config.num_frames == m_default_config->num_frames) {
+                merged_generation_config.num_frames = (source_shape[0] - 1) / temporal_ratio * temporal_ratio + 1;
+            }
+            if (!properties.count(ov::genai::height.name()) && m_generation_config.height == m_default_config->height) {
+                merged_generation_config.height = static_cast<int64_t>(source_shape[1]) / spatial_ratio * spatial_ratio;
+            }
+            if (!properties.count(ov::genai::width.name()) && m_generation_config.width == m_default_config->width) {
+                merged_generation_config.width = static_cast<int64_t>(source_shape[2]) / spatial_ratio * spatial_ratio;
+            }
+        }
         const float audio_guidance_scale =
             merged_generation_config.audio_guidance_scale.value_or(merged_generation_config.guidance_scale);
 
@@ -902,7 +940,8 @@ private:
         const size_t latent_mel_bins =
             m_audio_vae->get_config().mel_bins / m_audio_vae->get_config().mel_compression_ratio;
 
-        const PreparedConditioning conditioning = prepare_conditioning(request, merged_generation_config, frame_rate);
+        const PreparedConditioning conditioning =
+            prepare_conditioning(request, merged_generation_config, edit, frame_rate);
         const size_t tokens_per_frame = m_latent_height * m_latent_width;
         const size_t sequence_length =
             conditioning.active ? conditioning.init.get_shape()[1] : conditioning.base_tokens;
@@ -1000,7 +1039,36 @@ private:
 
         // mu from the packed video sequence length, as in the reference; audio reuses it
         const double mu = m_video_scheduler->calculate_shift(sequence_length);
-        const std::optional<std::vector<float>>& schedule = merged_generation_config.sigmas;
+        // Editing runs the last steps of the schedule, sliced before the scheduler shifts it. Shifting maps each
+        // sigma on its own and the terminal stretch keeps the last one, so this is the tail of the shifted schedule.
+        std::optional<std::vector<float>> schedule = merged_generation_config.sigmas;
+        if (edit) {
+            std::vector<float> full = schedule.value_or(std::vector<float>{});
+            if (full.empty()) {
+                const auto steps = static_cast<size_t>(merged_generation_config.num_inference_steps);
+                for (const double sigma : numpy_utils::linspace<double>(1.0, 1.0 / steps, steps, true)) {
+                    full.push_back(static_cast<float>(sigma));
+                }
+            }
+            size_t steps = full.size();
+            if (merged_generation_config.edit_num_steps) {
+                steps = *merged_generation_config.edit_num_steps;
+                OPENVINO_ASSERT(steps <= full.size(),
+                                "'edit_num_steps' ",
+                                steps,
+                                " exceeds the ",
+                                full.size(),
+                                " steps of the schedule");
+            } else {
+                steps = std::count_if(full.begin(), full.end(), [&](float sigma) {
+                    return sigma <= *merged_generation_config.noise_scale + 1e-6f;
+                });
+            }
+            OPENVINO_ASSERT(steps > 0,
+                            "No step of the schedule is at or below 'noise_scale' ",
+                            *merged_generation_config.noise_scale);
+            schedule = std::vector<float>(full.end() - steps, full.end());
+        }
         // Separate scheduler instance for audio: step() tracks per-modality state
         if (schedule) {
             m_video_scheduler->set_timesteps_from_sigmas(*schedule, mu);
@@ -1030,8 +1098,11 @@ private:
         if (conditioning.active) {
             // Noised to 'noise_scale' where nothing is kept:
             //   latents = noise * s + init * (1 - s), s = (1 - mask) * noise_scale
-            // diffusers' LTX2ConditionPipeline uses the first sigma; image-to-video starts from pure noise.
-            const float noise_scale = conditioning.packed_noise && schedule ? schedule->front() : 1.0f;
+            // diffusers' LTX2ConditionPipeline defaults it to the first sigma; image-to-video starts from pure noise.
+            const float noise_scale =
+                conditioning.packed_noise
+                    ? merged_generation_config.noise_scale.value_or(schedule ? schedule->front() : 1.0f)
+                    : 1.0f;
             const size_t channels = transformer_config.in_channels;
             float* data = latent.data<float>();
             const float* init = conditioning.init.data<const float>();
